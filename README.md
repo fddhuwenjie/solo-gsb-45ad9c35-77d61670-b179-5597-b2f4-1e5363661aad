@@ -116,6 +116,89 @@ docker compose down -v && docker compose up --build
 （`weekday`/`weekend`/`holiday`/`workday`）、分摊能量、命中规则、所在阶梯、
 该段在累计阶梯中的用量区间、单价与金额。`total_amount` 四舍五入到分。
 
+### `POST /usage-estimate`
+
+**电表用量缺失、但账单金额已知**时，反推可能的用量区间（纯计算，复用
+`/quote` 引擎）。请求给出规则版本、一个**不含 `energy`** 的时间区间
+（格式与 `/quote` 相同）、**非负且最多两位小数**的 `billed_amount`
+（账单上已舍入到分的金额），以及 `0 < max_energy ≤ 1000000`、最多六位
+小数的用量上界：
+
+```bash
+# 示例在本机 8000 端口运行：
+# uvicorn app.main:app --port 8000
+curl -s -X POST localhost:8000/usage-estimate -H 'Content-Type: application/json' -d '{
+  "version": "us-ny-demo-v2024",
+  "interval": {
+    "start": "2024-07-06T00:00:00-04:00",
+    "end":   "2024-07-06T02:00:00-04:00",
+    "timezone": "America/New_York"
+  },
+  "billed_amount": "1.50",
+  "max_energy": "50"
+}'
+```
+
+反推规则：
+
+- **假定区间内功率恒定**：试探用量按 UTC 时长均匀分摊，与 `/quote` 的
+  分摊方式完全一致——因此**逐网格点报价复用 `/quote` 的时间切分、
+  累计阶梯与金额舍入**（逐段金额六位小数、合计再 `ROUND_HALF_UP` 到分）。
+- 用量是 **`0.000001` 能量单位的离散网格**（`0, 0.000001, …,
+  max_energy`）；**零用量视为零费用**（空报价，不命中任何规则）。
+- 两位小数报价是网格序号上的**单调不减阶梯函数**；服务端用 **`Decimal`
+  整数序号二分**分别找到目标金额平台的**左、右边界**（全程无浮点，
+  `max_energy=1000000` 时也只需约 40 次报价）。
+
+上面的请求发生在周六（`leisure` @0.15），账单 1.50 对应一个非退化平台，
+响应（`min_quote` / `max_quote` 为两端点完整的 `/quote` 报价，字段与
+`/quote` 一致，此处省略）：
+
+```json
+{
+  "version": "us-ny-demo-v2024",
+  "currency": "USD",
+  "energy_unit": "kWh",
+  "billed_amount": "1.50",
+  "max_energy": "50.000000",
+  "grid_step": "0.000001",
+  "feasible": true,
+  "min_energy": "9.966664",
+  "max_energy_solution": "10.033329",
+  "min_quote": {"total_energy": "9.966664", "total_amount": "1.50",
+                "matched_rules": ["leisure"], "segments": ["…与 /quote 完全一致…"]},
+  "max_quote": {"total_energy": "10.033329", "total_amount": "1.50",
+                "matched_rules": ["leisure"], "segments": ["…与 /quote 完全一致…"]},
+  "matched_rules": ["leisure"],
+  "reason_code": null,
+  "reason": null,
+  "reachable_max": null,
+  "below": null,
+  "above": null
+}
+```
+
+- `feasible`：网格上是否存在报价**恰为** `billed_amount` 的用量；
+- `min_energy` / `max_energy_solution`：目标金额平台的最小、最大用量
+  （含端点；后者刻意命名为 `max_energy_solution`，与请求上界
+  `max_energy` 区分）；两端点外侧相邻网格点的报价必然不等于目标金额；
+- `min_quote` / `max_quote`：两端点的完整 `/quote` 报价（零用量端点
+  为零费用空报价）；`matched_rules` 为两端点命中规则的并集。
+
+**无解**时 HTTP 仍为 200、`feasible=false`，并区分两种原因、给出相邻
+网格点：
+
+| reason_code | 含义 | 附带字段 |
+| --- | --- | --- |
+| `above_reachable_max` | 目标金额**超过可达上界**：`max_energy` 网格点的报价仍低于目标 | `reachable_max`（上界网格点的用量、舍入金额、未舍入金额、命中规则） |
+| `rounding_gap` | 金额在相邻网格点间发生**两位小数舍入跳跃**，目标被跳过（如单价极高时一个网格步就跨过整分） | `below` / `above`：舍入金额低于/高于目标的最后/第一个网格点（含用量、舍入金额、未舍入金额、命中规则），两者恰好相差一个网格步 |
+
+例如单价 15000/单位时，`0.000001` 用量已报 0.02，目标 `0.01` 无解：
+`below` 为用量 `0.000000` 报 `0.00`、`above` 为用量 `0.000001`
+报 `0.02`（`raw_amount=0.015000`）。`billed_amount=0` 时平台从
+`0.000000` 起（零用量即零费用）；区间解析、DST 缺口/歧义、规则缺口
+（`rule_gap`）与结构冲突（`rule_conflict`）等报错语义与 `/quote` 一致。
+
 ### 夏令时示例
 
 2024 年纽约春令时在 **3 月 10 日 02:00 → 03:00** 跳时。上面的请求从
@@ -767,6 +850,7 @@ curl -s -X POST localhost:8000/versions/import -H 'Content-Type: application/jso
 | GET | `/versions/{code}/issues` | **显式校验**：返回规则时间重叠与阶梯缺口 |
 | POST | `/versions/import` | 导入完整版本（单事务落库、SHA-256 内容摘要、幂等重放，见上） |
 | POST | `/quote-diff` | 两版本对同一组用量区间独立报价并逐段对比（见上） |
+| POST | `/usage-estimate` | 账单金额已知、用量缺失：在 0.000001 用量网格上 Decimal 二分反推金额平台左右边界（见上） |
 | POST | `/shift-plan` | 两项可移时任务在 8 小时窗口内枚举 30 分钟候选，统一报价选最低费用组合（见上） |
 | POST | `/meter-readings/reconcile` | 累计表计读数对账：排序去重、reset 断列、回卷与采样间隔 gap，产出可直提 `/quote` 的用量区间（见上） |
 | POST | `/demand-charge` | 不等长用量区间按本地午夜对齐的 15/30/60 分钟窗口结算最大需量：DST 感知枚举、按实际时长精确分摊、逐输入能量守恒、逐输入全窗口切片对账（见上） |
@@ -842,7 +926,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 130 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 147 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -862,7 +946,14 @@ rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选�
 守恒（含跨成员不同时区与春季 DST 23 小时）、同段负荷合并后复用引擎的
 联盟报价、对称/非对称 Shapley 值与独立排列枚举对账、末位成员吸收舍入
 残差保证归属额严格等于全体合并报价、2～6 成员边界与空联盟、独立报价
-对账、重复 ID / 成员内重叠 / 规则缺口等校验路径。
+对账、重复 ID / 成员内重叠 / 规则缺口等校验路径，以及
+`/usage-estimate` 的 0.000001 网格反推：恒定功率复用 `/quote` 切分与
+舍入、Decimal 整数序号二分平台左右边界（含大网格 10^12 点仅约 40 次
+报价的端点锐度）、平台两端报价与 `/quote` 逐段一致、跨规则跨阶梯与
+春季 DST 切分、零用量零费用平台、`above_reachable_max` 上界报价与
+`rounding_gap` 相邻网格点（含高单价逐分跳跃与网格内跳分）、金额两位
+小数/用量六位小数与取值范围校验、区间禁带 `energy`、未知版本 404 与
+DST 缺口报错。
 
 ## 目录结构
 
@@ -871,6 +962,7 @@ app/
   main.py        # FastAPI 路由与错误处理
   schemas.py    # Pydantic 请求/响应模型
   pricing.py    # 核心引擎：时区/DST/日历/切分/阶梯/校验
+  estimate.py   # 用量反推：0.000001 网格 + Decimal 二分金额平台
   diff.py        # 版本对比：原子段切分、差额与变化原因
   shiftplan.py  # 移时排程：30 分钟枚举 + 统一报价选优
   meter.py      # 表计对账：排序去重、reset 断列、回卷与采样间隔 gap

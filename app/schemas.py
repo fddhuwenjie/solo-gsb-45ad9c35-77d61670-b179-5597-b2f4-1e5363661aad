@@ -105,6 +105,105 @@ class QuoteResponse(BaseModel):
     segments: list[SegmentOut]
 
 
+# --------------------------------------------------------- usage estimation
+
+
+class UsageEstimateIntervalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: str = Field(
+        ..., description="ISO-8601 开始时间；建议携带偏移量（如 2024-03-10T01:00:00-05:00）"
+    )
+    end: str = Field(..., description="ISO-8601 结束时间，半开区间 [start, end)")
+    timezone: str = Field(
+        ..., description="解释朴素时间所用的 IANA 时区，如 America/New_York"
+    )
+    # 注意：这里**刻意不含** energy——用量正是待反推的未知量。
+
+
+class UsageEstimateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(..., description="规则版本号，如 us-ny-demo-v2024")
+    interval: UsageEstimateIntervalIn = Field(
+        ..., description="一个不含 energy 的时间区间（格式与 /quote 一致）；"
+        "假定区间内功率恒定"
+    )
+    billed_amount: Decimal = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="账单上的已舍入金额（非负，最多两位小数，单位与币种随版本）",
+    )
+    max_energy: Decimal = Field(
+        ..., gt=0, le=Decimal("1000000"), allow_inf_nan=False,
+        description="用量上界（0 < max_energy ≤ 1000000，最多六位小数）",
+    )
+
+    @field_validator("billed_amount")
+    @classmethod
+    def _billed_two_dp(cls, value: Decimal) -> Decimal:
+        if value.as_tuple().exponent < -2:
+            raise ValueError("billed_amount 最多保留两位小数")
+        return value
+
+    @field_validator("max_energy")
+    @classmethod
+    def _max_energy_six_dp(cls, value: Decimal) -> Decimal:
+        if value.as_tuple().exponent < -6:
+            raise ValueError("max_energy 最多保留六位小数")
+        return value
+
+
+class UsageEstimateNeighborIn(BaseModel):
+    energy: str = Field(..., description="相邻网格点的用量（六位小数）")
+    total_amount: str = Field(
+        ..., description="该网格点 /quote 报出并舍入到分的金额"
+    )
+    raw_amount: str = Field(
+        ..., description="该网格点未舍入的逐段金额之和（六位小数）"
+    )
+    matched_rules: list[str]
+
+
+class UsageEstimateResponse(BaseModel):
+    version: str
+    currency: str
+    energy_unit: str
+    billed_amount: str = Field(..., description="回显请求的目标账单金额（两位小数）")
+    max_energy: str = Field(..., description="回显请求的用量上界（六位小数）")
+    grid_step: str = Field(
+        "0.000001", description="用量离散网格步长（0.000001 能量单位）"
+    )
+    feasible: bool = Field(
+        ..., description="是否存在落在 0.000001 网格上、报价恰为 billed_amount 的用量"
+    )
+    min_energy: str | None = Field(
+        None, description="有解时目标金额平台的最小用量（含）"
+    )
+    max_energy_solution: str | None = Field(
+        None,
+        description="有解时目标金额平台的最大用量（含；与请求上界 max_energy 区分）",
+    )
+    min_quote: QuoteResponse | None = None
+    max_quote: QuoteResponse | None = None
+    matched_rules: list[str] = Field(
+        ..., description="两端点报价命中规则的并集（零用量时为空）"
+    )
+    reason_code: str | None = Field(
+        None, description="无解原因：above_reachable_max=超过可达上界；"
+        "rounding_gap=两位小数舍入跳过目标金额"
+    )
+    reason: str | None = Field(None, description="无解时的中文说明")
+    reachable_max: UsageEstimateNeighborIn | None = Field(
+        None, description="above_reachable_max 时 max_energy 网格点的报价"
+    )
+    below: UsageEstimateNeighborIn | None = Field(
+        None, description="rounding_gap 时舍入金额低于目标金额的最后一个网格点"
+    )
+    above: UsageEstimateNeighborIn | None = Field(
+        None, description="rounding_gap 时舍入金额高于目标金额的第一个网格点"
+    )
+
+
 class TierOut(BaseModel):
     ordinal: int
     cumulative_cap: str | None

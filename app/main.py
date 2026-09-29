@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from . import allocation, demand, diff, importer, meter, pricing, shiftplan
+from . import allocation, demand, diff, estimate, importer, meter, pricing, shiftplan
 from .database import engine, init_db
 from .pricing import (
     Q2,
@@ -46,6 +46,9 @@ from .schemas import (
     ShiftSegmentOut,
     ShiftTaskOut,
     TierOut,
+    UsageEstimateNeighborIn,
+    UsageEstimateRequest,
+    UsageEstimateResponse,
     VersionImportRequest,
     VersionImportResponse,
     VersionOut,
@@ -132,21 +135,108 @@ def post_quote(req: QuoteRequest):
     with Session(engine) as session:
         version = load_version(session, req.version)
         result = pricing.quote(version, req.intervals)
+    return _quote_out(version, result)
 
+
+def _quote_out(version, result):
+    """Build a /quote-shaped response; an empty result is the zero quote."""
+    if result is None:
+        return QuoteResponse(
+            version=version.code,
+            currency=version.currency,
+            energy_unit=version.energy_unit,
+            total_energy="0.000000",
+            total_amount="0.00",
+            matched_rules=[],
+            segments=[],
+        )
     segments = [
         SegmentOut(**s.to_dict(version.energy_unit, version.currency))
         for s in result.segments
     ]
-    total_energy = result.total_energy
     total_amount = result.total_amount.quantize(Q2, rounding=ROUND_HALF_UP)
     return QuoteResponse(
         version=version.code,
         currency=version.currency,
         energy_unit=version.energy_unit,
-        total_energy=str(total_energy),
+        total_energy=str(result.total_energy),
         total_amount=str(total_amount),
         matched_rules=result.matched_rules,
         segments=segments,
+    )
+
+
+def _estimate_neighbor_out(point):
+    if point is None:
+        return None
+    return UsageEstimateNeighborIn(
+        energy=str(point.energy.quantize(Q6)),
+        total_amount=str(point.total_amount),
+        raw_amount=str(point.raw_amount.quantize(Q6)),
+        matched_rules=point.matched_rules,
+    )
+
+
+@app.post("/usage-estimate", response_model=UsageEstimateResponse,
+          tags=["quote"])
+def post_usage_estimate(req: UsageEstimateRequest):
+    """反推账单金额对应的缺失电表用量（0.000001 能量单位离散网格）。
+
+    假定给定时间区间内功率恒定，复用 /quote 的时间切分、累计阶梯与金额
+    舍入逐网格点报价；零用量按零费用处理。用 Decimal 二分分别定位目标
+    金额平台的左右边界，返回平台最小/最大用量及两端完整报价。无解时
+    区分超过可达上界（above_reachable_max）与两位小数舍入跳跃
+    （rounding_gap，并给出相邻网格点）。
+    """
+    with Session(engine) as session:
+        version = load_version(session, req.version)
+        out = estimate.estimate(version, req)
+
+    billed = req.billed_amount.quantize(Q2)
+    max_energy = req.max_energy.quantize(Q6)
+    if not out.feasible:
+        return UsageEstimateResponse(
+            version=version.code,
+            currency=version.currency,
+            energy_unit=version.energy_unit,
+            billed_amount=str(billed),
+            max_energy=str(max_energy),
+            feasible=False,
+            matched_rules=[],
+            reason_code=out.reason_code,
+            reason=out.reason,
+            reachable_max=(
+                _estimate_neighbor_out(out.reachable_max)
+                if out.reason_code == "above_reachable_max" else None
+            ),
+            below=(
+                _estimate_neighbor_out(out.left)
+                if out.reason_code == "rounding_gap" else None
+            ),
+            above=(
+                _estimate_neighbor_out(out.right)
+                if out.reason_code == "rounding_gap" else None
+            ),
+        )
+
+    left, right = out.left, out.right
+    rules: list[str] = []
+    for p in (left, right):
+        for code in p.matched_rules:
+            if code not in rules:
+                rules.append(code)
+    return UsageEstimateResponse(
+        version=version.code,
+        currency=version.currency,
+        energy_unit=version.energy_unit,
+        billed_amount=str(billed),
+        max_energy=str(max_energy),
+        feasible=True,
+        min_energy=str(left.energy.quantize(Q6)),
+        max_energy_solution=str(right.energy.quantize(Q6)),
+        min_quote=_quote_out(version, left.result),
+        max_quote=_quote_out(version, right.result),
+        matched_rules=rules,
     )
 
 
