@@ -567,3 +567,82 @@ class DemandChargeResponse(BaseModel):
     reason: str | None
     excluded_windows: list[ExcludedWindowOut]
 
+
+# ------------------------------------------------------------ usage estimate
+
+
+class UsageEstimateIntervalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: str = Field(
+        ..., description="ISO-8601 开始时间；建议携带偏移量（如 2024-07-06T00:00:00-04:00）"
+    )
+    end: str = Field(..., description="ISO-8601 结束时间，半开区间 [start, end)")
+    timezone: str = Field(
+        ..., description="解释朴素时间所用的 IANA 时区，如 America/New_York"
+    )
+
+
+class UsageEstimateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(..., description="规则版本号，如 us-ny-demo-v2024")
+    interval: UsageEstimateIntervalIn = Field(
+        ..., description="单段时间区间（与 /quote 区间同格式，但不含 energy）"
+    )
+    billed_amount: Decimal = Field(
+        ..., ge=0, allow_inf_nan=False, decimal_places=2,
+        description="账单金额：非负、最多两位小数（已舍入到分的金额）",
+    )
+    max_energy: Decimal = Field(
+        ..., gt=0, le=1000000, allow_inf_nan=False, decimal_places=6,
+        description="用量搜索上界：0 < max_energy ≤ 1000000，最多六位小数",
+    )
+
+
+class EstimateGridPointOut(BaseModel):
+    energy: str = Field(..., description="网格用量（六位小数）")
+    amount: str = Field(..., description="该用量对应的账单金额（两位小数）")
+
+
+class UsageEstimateResponse(BaseModel):
+    version: str
+    currency: str
+    energy_unit: str
+    billed_amount: str = Field(..., description="回显目标账单金额（两位小数）")
+    solvable: bool = Field(
+        ..., description="是否存在使账单金额等于目标的网格用量"
+    )
+    min_energy: str | None = Field(
+        None, description="有解时：目标金额平台的左边界（最小用量，六位小数）"
+    )
+    max_energy: str | None = Field(
+        None, description="有解时：目标金额平台的右边界（最大用量，六位小数，"
+        "不超过请求的 max_energy 上界）"
+    )
+    matched_rules: list[str] = Field(
+        default_factory=list, description="有解时：两端报价命中规则的并集"
+    )
+    min_quote: QuoteResponse | None = Field(
+        None, description="有解时：最小用量端的完整报价（与 /quote 同结构；"
+        "零用量端为零费用、无计价段的空报价）"
+    )
+    max_quote: QuoteResponse | None = Field(
+        None, description="有解时：最大用量端的完整报价（与 /quote 同结构）"
+    )
+    quotes_evaluated: int = Field(
+        ..., description="二分过程中实际执行的报价次数"
+    )
+    reason_code: str | None = Field(
+        None, description="无解时的机器可读原因：amount_above_reachable / "
+        "rounding_jump"
+    )
+    reason: str | None = Field(None, description="无解时的说明")
+    lower_neighbor: EstimateGridPointOut | None = Field(
+        None, description="无解时：夹住目标金额的下侧相邻网格点及其账单金额"
+    )
+    upper_neighbor: EstimateGridPointOut | None = Field(
+        None, description="无解时：夹住目标金额的上侧相邻网格点及其账单金额"
+        "（amount_above_reachable 时为 null）"
+    )
+

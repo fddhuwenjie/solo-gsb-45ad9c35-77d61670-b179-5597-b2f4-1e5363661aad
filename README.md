@@ -682,6 +682,88 @@ curl -s -X POST localhost:8000/cost-allocation -H 'Content-Type: application/jso
   `rule_gap`**；成员 ID 重复返回 **400 `duplicate_member`**；同一成员
   内部区间重叠返回 **400 `interval_overlap`**。
 
+### `POST /usage-estimate`
+
+电表用量缺失、但账单金额已知时，反推与账单一致的**用量区间**。请求给出
+规则版本、一段**不含 `energy`** 的时间区间（与 `/quote` 区间同格式）、
+账单金额 `billed_amount`（非负、最多两位小数）与用量搜索上界
+`max_energy`（`0 < max_energy ≤ 1000000`、最多六位小数）。
+
+请求示例（服务端口 **8000**）：
+
+```bash
+curl -s -X POST localhost:8000/usage-estimate -H 'Content-Type: application/json' -d '{
+  "version": "us-ny-demo-v2024",
+  "interval": {
+    "start": "2024-07-06T00:00:00-04:00",
+    "end":   "2024-07-06T04:00:00-04:00",
+    "timezone": "America/New_York"
+  },
+  "billed_amount": "1.50",
+  "max_energy": "100"
+}'
+```
+
+反推规则：
+
+- 假定区间内**功率恒定**：能量按实际 UTC 时长比例分布，与 `/quote`
+  对单段区间的分摊完全一致；时间切分（本地午夜 / DST / 规则边界）、
+  累计阶梯与金额舍入（分段六位小数、合计四舍五入到分）都复用
+  `/quote` 引擎；
+- 在 **0.000001 能量单位**的离散网格上，用 Decimal 二分分别定位
+  “账单金额 == billed_amount” 平台的**左、右边界**（网格最多
+  10¹² 个点，二分约 40 步）；**零用量视为零费用**；
+- 账单金额关于用量单调不减（各档单价非负），因此解集必为一段连续平台。
+
+有解时（`solvable=true`）返回平台两端用量、两端完整报价与命中规则：
+
+```json
+{
+  "version": "us-ny-demo-v2024",
+  "currency": "USD",
+  "energy_unit": "kWh",
+  "billed_amount": "1.50",
+  "solvable": true,
+  "min_energy": "9.966664",
+  "max_energy": "10.033329",
+  "matched_rules": ["leisure"],
+  "min_quote": {"total_energy": "9.966664", "total_amount": "1.50",
+                "matched_rules": ["leisure"],
+                "segments": [{"rule_code": "leisure", "tier_ordinal": 1,
+                              "energy": "9.966664", "unit_price": "0.15",
+                              "amount": "1.495000", "...": "其余字段与 /quote 相同"}]},
+  "max_quote": {"total_energy": "10.033329", "total_amount": "1.50",
+                "matched_rules": ["leisure"], "segments": ["..."]},
+  "quotes_evaluated": 54,
+  "reason_code": null,
+  "reason": null,
+  "lower_neighbor": null,
+  "upper_neighbor": null
+}
+```
+
+- `min_energy` / `max_energy`：目标金额平台的最小 / 最大用量（六位小数）；
+  两端再各退一步（±0.000001），账单金额就会偏离目标；
+- `min_quote` / `max_quote`：两端用量的**完整 `/quote` 报价**（含逐段
+  明细，可对照分段、阶梯与单价）；零用量端为零费用、无计价段的空报价；
+- `matched_rules`：两端报价命中规则的并集；`quotes_evaluated` 为二分
+  过程中实际执行的报价次数。
+
+无解时（`solvable=false`，HTTP 仍为 200）用 `reason_code` 区分两种形态，
+并给出夹住目标金额的**相邻网格点**及其账单金额：
+
+| reason_code | 含义 |
+| --- | --- |
+| `amount_above_reachable` | 用量达到 `max_energy` 上界时账单金额仍低于目标（目标超过可达上界）；`lower_neighbor` 为上界点及其金额，`upper_neighbor` 为 `null` |
+| `rounding_jump` | 账单金额在相邻两个网格点之间跳过目标（单价极高时一个网格步进就越过 1 分）；`lower_neighbor` / `upper_neighbor` 为夹住目标的相邻两点及其金额 |
+
+例如上界 1 kWh 的周六区间最多产生 0.15 USD 的账单，目标 999.00 即
+`amount_above_reachable`（`lower_neighbor` 为 `{"energy": "1.000000",
+"amount": "0.15"}`）。输入校验沿用 `/quote` 语义：区间非法
+（400 `invalid_interval`）、朴素时间落入 DST 缺口/歧义（400）、版本未
+知（404）、计价区间遇规则缺口（409 `rule_gap`）；`billed_amount` /
+`max_energy` 的符号、上界与小数位数校验失败返回 422。
+
 ### `POST /versions/import`
 
 导入一个**完整费率版本**（版本 + 嵌套的 `holidays`、`rules`、`tiers`），
@@ -771,6 +853,7 @@ curl -s -X POST localhost:8000/versions/import -H 'Content-Type: application/jso
 | POST | `/meter-readings/reconcile` | 累计表计读数对账：排序去重、reset 断列、回卷与采样间隔 gap，产出可直提 `/quote` 的用量区间（见上） |
 | POST | `/demand-charge` | 不等长用量区间按本地午夜对齐的 15/30/60 分钟窗口结算最大需量：DST 感知枚举、按实际时长精确分摊、逐输入能量守恒、逐输入全窗口切片对账（见上） |
 | POST | `/cost-allocation` | 共享电表 2～6 个成员：UTC 端点原子段 + 按实际时长分摊合并，枚举全部联盟以 Shapley 值公平拆分阶梯电费，归属额严格合计为全体报价（见上） |
+| POST | `/usage-estimate` | 账单金额已知、用量缺失时反推用量区间：恒定功率假设 + 0.000001 网格 Decimal 二分定位目标金额平台两端，无解时区分超过可达上界与舍入跳跃（见上） |
 
 ## 错误处理
 
@@ -842,7 +925,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 130 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 143 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -862,7 +945,11 @@ rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选�
 守恒（含跨成员不同时区与春季 DST 23 小时）、同段负荷合并后复用引擎的
 联盟报价、对称/非对称 Shapley 值与独立排列枚举对账、末位成员吸收舍入
 残差保证归属额严格等于全体合并报价、2～6 成员边界与空联盟、独立报价
-对账、重复 ID / 成员内重叠 / 规则缺口等校验路径。
+对账、重复 ID / 成员内重叠 / 规则缺口等校验路径，以及
+`/usage-estimate` 的目标金额平台左右边界（与 `/quote` 逐点对账：两端
+命中目标、相邻网格点偏离）、跨阶梯平台、零账单的零用量端、跨规则命中
+规则并集、春令时切分一致性、超过可达上界与舍入跳跃两种无解形态
+（含相邻网格点）、单点平台与全部输入校验路径。
 
 ## 目录结构
 
@@ -876,6 +963,7 @@ app/
   meter.py      # 表计对账：排序去重、reset 断列、回卷与采样间隔 gap
   demand.py     # 最大需量：本地午夜对齐窗口、DST 枚举、精确分摊与选优
   allocation.py # 共享电表：原子段合并、联盟枚举、Shapley 公平拆分
+  estimate.py   # 用量反推：恒定功率假设、离散网格二分定位金额平台
   importer.py   # 版本导入：规范化、SHA-256 摘要、定位校验、单事务落库
   database.py   # SQLAlchemy 模型与预置版本数据
 tests/          # pytest 端到端测试

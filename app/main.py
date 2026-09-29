@@ -9,11 +9,14 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from . import allocation, demand, diff, importer, meter, pricing, shiftplan
+from . import (
+    allocation, demand, diff, estimate, importer, meter, pricing, shiftplan,
+)
 from .database import engine, init_db
 from .pricing import (
     Q2,
     Q6,
+    ZERO,
     PricingError,
     load_version,
     validate_version,
@@ -30,6 +33,7 @@ from .schemas import (
     DemandWindowOut,
     DiffSegmentOut,
     DiffSideOut,
+    EstimateGridPointOut,
     ExcludedWindowOut,
     MeterGapOut,
     MeterIntervalOut,
@@ -46,6 +50,8 @@ from .schemas import (
     ShiftSegmentOut,
     ShiftTaskOut,
     TierOut,
+    UsageEstimateRequest,
+    UsageEstimateResponse,
     VersionImportRequest,
     VersionImportResponse,
     VersionOut,
@@ -127,26 +133,85 @@ def post_version_import(req: VersionImportRequest, response: Response):
     return body
 
 
+def _quote_response(version, result) -> QuoteResponse:
+    """Build the /quote response body; ``result=None`` is a zero-usage quote
+    (zero fee, no segments) used by /usage-estimate plateau endpoints."""
+    if result is None:
+        return QuoteResponse(
+            version=version.code,
+            currency=version.currency,
+            energy_unit=version.energy_unit,
+            total_energy=str(ZERO.quantize(Q6)),
+            total_amount=str(ZERO.quantize(Q2)),
+            matched_rules=[],
+            segments=[],
+        )
+    return QuoteResponse(
+        version=version.code,
+        currency=version.currency,
+        energy_unit=version.energy_unit,
+        total_energy=str(result.total_energy),
+        total_amount=str(result.total_amount.quantize(
+            Q2, rounding=ROUND_HALF_UP)),
+        matched_rules=result.matched_rules,
+        segments=[
+            SegmentOut(**s.to_dict(version.energy_unit, version.currency))
+            for s in result.segments
+        ],
+    )
+
+
 @app.post("/quote", response_model=QuoteResponse, tags=["quote"])
 def post_quote(req: QuoteRequest):
     with Session(engine) as session:
         version = load_version(session, req.version)
         result = pricing.quote(version, req.intervals)
+    return _quote_response(version, result)
 
-    segments = [
-        SegmentOut(**s.to_dict(version.energy_unit, version.currency))
-        for s in result.segments
-    ]
-    total_energy = result.total_energy
-    total_amount = result.total_amount.quantize(Q2, rounding=ROUND_HALF_UP)
-    return QuoteResponse(
+
+@app.post("/usage-estimate", response_model=UsageEstimateResponse,
+          tags=["quote"])
+def post_usage_estimate(req: UsageEstimateRequest):
+    """账单金额已知、电表用量缺失时，反推与账单一致的用量区间。
+
+    假定区间内功率恒定（能量按实际 UTC 时长比例分布，与 /quote 对单段
+    区间的分摊一致），在 0.000001 能量单位的离散网格上用 Decimal 二分
+    分别定位"账单金额 == billed_amount"平台的左右边界；零用量视为零
+    费用。无解时区分超过可达上界（amount_above_reachable）与相邻网格
+    点之间的舍入跳跃（rounding_jump），并给出夹住目标的网格点。
+    """
+    with Session(engine) as session:
+        version = load_version(session, req.version)
+        result = estimate.estimate(version, req)
+
+    def _point_out(p):
+        if p is None:
+            return None
+        return EstimateGridPointOut(
+            energy=str(p.energy.quantize(Q6)),
+            amount=str(p.amount.quantize(Q2)),
+        )
+
+    return UsageEstimateResponse(
         version=version.code,
         currency=version.currency,
         energy_unit=version.energy_unit,
-        total_energy=str(total_energy),
-        total_amount=str(total_amount),
+        billed_amount=str(result.billed_amount.quantize(Q2)),
+        solvable=result.solvable,
+        min_energy=(str(result.min_energy.quantize(Q6))
+                    if result.min_energy is not None else None),
+        max_energy=(str(result.max_energy.quantize(Q6))
+                    if result.max_energy is not None else None),
         matched_rules=result.matched_rules,
-        segments=segments,
+        min_quote=(_quote_response(version, result.min_quote)
+                   if result.min_energy is not None else None),
+        max_quote=(_quote_response(version, result.max_quote)
+                   if result.max_energy is not None else None),
+        quotes_evaluated=result.quotes_evaluated,
+        reason_code=result.reason_code,
+        reason=result.reason,
+        lower_neighbor=_point_out(result.lower),
+        upper_neighbor=_point_out(result.upper),
     )
 
 
